@@ -2,15 +2,17 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
 // Entry is one persisted cache record for a task.
 //
 // An entry is only usable when the task's fingerprint matches: the
-// fingerprint covers the task inputs/config AND the fingerprints of all
-// upstream artifacts, so a matching entry transitively guarantees that
-// every upstream input is unchanged as well.
+// fingerprint covers the task's own inputs/config AND the content
+// hashes of the upstream artifacts it actually consumed, so a matching
+// entry guarantees the task would observe byte-identical inputs if it
+// ran again.
 type Entry struct {
 	Version     int
 	Task        TaskID
@@ -21,8 +23,11 @@ type Entry struct {
 // Store persists cache entries across process restarts.
 //
 // Implementations must be safe for concurrent use. Get must return
-// ErrCacheVersion or ErrCacheCorrupt for entries that cannot be used;
-// the engine treats both as a clean miss.
+// ErrCacheVersion for entries written by an incompatible (older or
+// newer) build and ErrCacheCorrupt for entries whose bytes cannot be
+// trusted, so callers can distinguish the two failure kinds; the engine
+// treats both as a clean miss and self-heals by overwriting on the next
+// successful Put.
 type Store interface {
 	Get(ctx context.Context, task TaskID) (Entry, error)
 	Put(ctx context.Context, e Entry) error
@@ -48,6 +53,13 @@ func (s *memStore) Get(ctx context.Context, task TaskID) (Entry, error) {
 	e, ok := s.entries[task]
 	if !ok {
 		return Entry{}, ErrCacheMiss
+	}
+	// A recognizable entry written by an older/newer build is reported
+	// as a version incompatibility so callers can distinguish it from
+	// corruption; the engine treats both as a clean miss.
+	if e.Version != Version {
+		return e, fmt.Errorf("%w: entry version %d, want %d",
+			ErrCacheVersion, e.Version, Version)
 	}
 	return e, nil
 }

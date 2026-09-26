@@ -2,6 +2,8 @@ package graph
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -82,8 +84,12 @@ func TestCorruptEntriesAreMisses(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.Get(ctx, "a"); err == nil {
-			t.Fatalf("case %s: expected error on corrupt entry", name)
+		if _, err := store.Get(ctx, "a"); !errors.Is(err, ErrCacheCorrupt) {
+			t.Fatalf("case %s: want ErrCacheCorrupt, got %v", name, err)
+		}
+		// Corruption must not be misclassified as a version problem.
+		if errors.Is(err, ErrCacheVersion) {
+			t.Fatalf("case %s: corruption reported as ErrCacheVersion", name)
 		}
 		// Engine treats it as a miss, recomputes, and self-heals.
 		e2, aRuns2, bRuns2 := buildTwoNodeGraph(store)
@@ -125,15 +131,18 @@ func TestOldVersionEntry(t *testing.T) {
 	old := Entry{
 		Version:     Version - 1,
 		Task:        "a",
-		Fingerprint: "doesnt-matter",
+		Fingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
 		Output:      Artifact{Data: []byte("ancient")},
 	}
 	if err := store.Put(ctx, old); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.Get(ctx, "a")
-	if err != nil {
-		t.Fatalf("decoding old-format file should succeed: %v", err)
+	if !errors.Is(err, ErrCacheVersion) {
+		t.Fatalf("old logical version: want ErrCacheVersion, got %v", err)
+	}
+	if errors.Is(err, ErrCacheCorrupt) {
+		t.Fatalf("version incompatibility must not be reported as corruption")
 	}
 	if got.Version != Version-1 {
 		t.Fatalf("version round-trip wrong: %d", got.Version)
@@ -165,14 +174,21 @@ func TestOldOnDiskFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Flip format version byte (magic = 4 bytes, then version).
+	// Change the format version byte (magic = 4 bytes, then version)
+	// and re-seal the checksum, exercising the "recognized bytes but
+	// unsupported format version" path rather than bit rot.
 	b[4] = 99
+	sum := sha256.Sum256(b[:len(b)-sha256.Size])
+	copy(b[len(b)-sha256.Size:], sum[:])
 	if err := os.WriteFile(p, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	store := mustFileStore(t, dir)
-	if _, err := store.Get(ctx, "a"); err == nil {
-		t.Fatal("expected ErrCacheVersion for unknown format byte")
+	if _, err := store.Get(ctx, "a"); !errors.Is(err, ErrCacheVersion) {
+		t.Fatalf("want ErrCacheVersion for unknown format byte, got %v", err)
+	}
+	if errors.Is(err, ErrCacheCorrupt) {
+		t.Fatal("version incompatibility must not be reported as corruption")
 	}
 	// Still recoverable.
 	e2, aRuns, _ := buildTwoNodeGraph(store)
@@ -193,7 +209,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	e := Entry{
 		Version:     Version,
 		Task:        "task-x",
-		Fingerprint: "fp123",
+		Fingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
 		Output:      Artifact{Data: []byte{0, 1, 2, 3, 255}},
 	}
 	got, err := decodeEntry(encodeEntry(e))

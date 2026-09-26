@@ -89,12 +89,31 @@ func decodeEntry(data []byte) (Entry, error) {
 	}
 
 	entryVer := binary.BigEndian.Uint32(verField)
+	if !isHexString(fpField) {
+		return Entry{}, fmt.Errorf("%w: fingerprint is not hex", ErrCacheCorrupt)
+	}
 	return Entry{
 		Version:     int(entryVer),
 		Task:        TaskID(taskField),
 		Fingerprint: string(fpField),
 		Output:      Artifact{Data: outField},
 	}, nil
+}
+
+// isHexString reports whether b is non-empty and contains only ASCII
+// hexadecimal digits. Fingerprints produced by this engine are hex
+// SHA-256 strings, so any other shape signals a mangled entry.
+func isHexString(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+			(c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // appendBytes appends a uint32 length prefix followed by raw.

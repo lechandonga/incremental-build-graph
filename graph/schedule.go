@@ -7,12 +7,12 @@ import (
 )
 
 // resolution is the computed execution plan for one Run: the set of
-// reachable tasks in a topological order, together with per-task
-// fingerprints derived from the current inputs.
+// reachable tasks in a topological order. Per-task fingerprints are not
+// computed up front: they depend on the actual artifact bytes emitted
+// during this run, so they are derived at execution time in runTask.
 type resolution struct {
-	order       []TaskID
-	fingerprint map[TaskID]string
-	tasks       map[TaskID]*Task
+	order []TaskID
+	tasks map[TaskID]*Task
 }
 
 // resolve performs validation, cycle detection, reachability from
@@ -43,7 +43,6 @@ func (e *Engine) resolve(targets []TaskID) (*resolution, error) {
 		black = 2
 	)
 	color := make(map[TaskID]int)
-	fp := make(map[TaskID]string)
 	var order []TaskID
 
 	type frame struct {
@@ -99,39 +98,16 @@ func (e *Engine) resolve(targets []TaskID) (*resolution, error) {
 				}
 				continue
 			}
-			// All dependencies resolved: compute fingerprint from
-			// already-finalized dependency fingerprints. Duplicate
-			// edges on the same dependency are de-duplicated, matching
-			// the executor's indegree handling.
-			seenDep := make(map[TaskID]bool, len(t.Deps))
-			var depFps []string
-			for _, dep := range t.Deps {
-				if !seenDep[dep] {
-					seenDep[dep] = true
-					depFps = append(depFps, fp[dep])
-				}
-			}
-			fp[f.id] = fingerprint(t, depFps)
+			// All dependencies resolved. Duplicate edges on the same
+			// dependency are de-duplicated, matching the executor's
+			// indegree handling.
 			color[f.id] = black
 			order = append(order, f.id)
 			stack = stack[:len(stack)-1]
 		}
 	}
 
-	return &resolution{order: order, fingerprint: fp, tasks: tasks}, nil
-}
-
-// taskInputs adapts completed results to the Inputs interface.
-type taskInputs struct {
-	results map[TaskID]Result
-}
-
-func (in *taskInputs) Artifact(id TaskID) (Artifact, bool) {
-	r, ok := in.results[id]
-	if !ok {
-		return Artifact{}, false
-	}
-	return r.Output, true
+	return &resolution{order: order, tasks: tasks}, nil
 }
 
 const maxParallel = 64
@@ -328,11 +304,42 @@ func (e *Engine) execute(ctx context.Context, r *resolution) (map[TaskID]Result,
 // depResult fetches a completed dependency result.
 type depResult func(id TaskID) (Result, bool)
 
-// runTask produces one task Result: cache hit when the stored
-// fingerprint matches, otherwise execute and commit the new entry.
+// runTask produces one task Result. The fingerprint is derived from the
+// task's own inputs plus the content hashes of the upstream artifacts it
+// actually consumed during this run, so:
+//
+//   - a cache hit requires matching inputs/config AND byte-identical
+//     consumed upstream artifacts;
+//   - an upstream task that is recomputed but emits byte-identical
+//     output does NOT invalidate its downstreams;
+//   - any byte change in a consumed upstream artifact invalidates every
+//     downstream that reads it.
+//
+// On a miss the task executes and the new entry is committed to the
+// cache atomically per task.
 func (e *Engine) runTask(ctx context.Context, r *resolution, id TaskID, deps depResult) (Result, error) {
 	t := r.tasks[id]
-	wantFP := r.fingerprint[id]
+
+	// Content-based fingerprint of this task as observed right now:
+	// declared deps in order, duplicates collapsed, hashing the current
+	// upstream artifact bytes.
+	depContents := func() []depContent {
+		seen := make(map[TaskID]bool, len(t.Deps))
+		var dc []depContent
+		for _, d := range t.Deps {
+			if seen[d] {
+				continue
+			}
+			seen[d] = true
+			res, ok := deps(d)
+			if !ok {
+				continue
+			}
+			dc = append(dc, depContent{id: d, sum: artifactContentSum(res.Output)})
+		}
+		return dc
+	}
+	wantFP := fingerprint(t, depContents())
 
 	if entry, err := e.store.Get(ctx, id); err == nil {
 		if entry.Version == Version && entry.Fingerprint == wantFP {
@@ -351,7 +358,7 @@ func (e *Engine) runTask(ctx context.Context, r *resolution, id TaskID, deps dep
 		return Result{}, err
 	}
 
-	in := &liveInputs{r: r, deps: deps}
+	in := &liveInputs{deps: deps}
 	out, err := t.Run(ctx, in)
 	if err != nil {
 		return Result{}, &TaskError{Task: id, Err: err}
@@ -377,7 +384,6 @@ func (e *Engine) runTask(ctx context.Context, r *resolution, id TaskID, deps dep
 // liveInputs resolves upstream artifacts from completed results at
 // execution time.
 type liveInputs struct {
-	r    *resolution
 	deps depResult
 }
 

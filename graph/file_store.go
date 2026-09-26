@@ -3,33 +3,73 @@ package graph
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // FileStore persists cache entries as one file per task under a
 // directory, so hits survive process restarts.
 //
-// Files with a bad/unknown version, truncated bodies or checksum
-// mismatches decode as ErrCacheCorrupt / ErrCacheVersion, which the
-// engine treats as misses; the stale file is overwritten on the next
-// successful Put.
+// Task identifiers are mapped to file paths through an injective,
+// root-confined encoding (see entryRelPath), so ids containing path
+// separators, "."/".." segments or other hierarchical fragments are
+// fully legal and can never escape the store directory or alias another
+// id. Different store directories are strictly isolated.
+//
+// Writes go through a uniquely named temp file followed by an atomic
+// rename; an interrupted write therefore leaves at most a "*.tmp"
+// orphan, never a partially visible entry. Temp orphans are swept once
+// when the store is (re)opened, under an exclusive cross-process lock
+// that also serializes concurrent writers, so orphans cannot accumulate
+// indefinitely and valid entries are never removed.
 type FileStore struct {
 	dir string
+
+	// mu serializes writes/sweeps within the process; flock serializes
+	// across processes sharing the same directory.
+	mu   sync.Mutex
+	lock *fileLock
 }
 
 // NewFileStore creates (if needed) and returns a FileStore rooted at
-// dir.
+// dir. Any interrupted temp files left in dir by a previous crashed
+// process are cleaned up; committed entries are left untouched.
 func NewFileStore(dir string) (*FileStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
+
 	}
-	return &FileStore{dir: dir}, nil
+	fl, err := newFileLock(dir)
+	if err != nil {
+		return nil, err
+	}
+	s := &FileStore{dir: dir, lock: fl}
+
+	// Sweep exclusively so a concurrent opener/writer in another process
+	// cannot have an in-flight temp file removed.
+	if err := s.withLock(s.sweepTempFiles); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// withLock runs fn while holding the in-process mutex and the
+// cross-process directory lock.
+func (s *FileStore) withLock(fn func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.lock.lock(); err != nil {
+		return err
+	}
+	defer s.lock.unlock()
+	return fn()
 }
 
 func (s *FileStore) path(task TaskID) string {
-	return filepath.Join(s.dir, string(task)+".cache")
+	return filepath.Join(s.dir, entryRelPath(task))
 }
 
 func (s *FileStore) Get(ctx context.Context, task TaskID) (Entry, error) {
@@ -40,12 +80,36 @@ func (s *FileStore) Get(ctx context.Context, task TaskID) (Entry, error) {
 		}
 		return Entry{}, err
 	}
-	return decodeEntry(data)
+	entry, err := decodeEntry(data)
+	if err != nil {
+		// ErrCacheVersion (unknown on-disk format) or ErrCacheCorrupt
+		// (bad magic, truncation, checksum, malformed fields).
+		return Entry{}, err
+	}
+	// A structurally valid file whose embedded task id does not match
+	// the key it was read under is inconsistent content, not a version
+	// problem (defensive: entryRelPath is injective, so this can only
+	// arise from a swapped/forged file).
+	if entry.Task != task {
+		return Entry{}, fmt.Errorf("%w: entry task %q does not match key %q",
+			ErrCacheCorrupt, entry.Task, task)
+	}
+	if entry.Version != Version {
+		return entry, fmt.Errorf("%w: entry version %d, want %d",
+			ErrCacheVersion, entry.Version, Version)
+	}
+	return entry, nil
 }
 
 func (s *FileStore) Put(ctx context.Context, e Entry) error {
-	data := encodeEntry(e)
-	return writeFileRenamed(s.path(e.Task), data)
+	path := s.path(e.Task)
+	return s.withLock(func() error {
+		// The hashed layout may require a shard directory.
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		return writeFileRenamed(path, encodeEntry(e))
+	})
 }
 
 func (s *FileStore) Delete(ctx context.Context, task TaskID) error {
@@ -56,13 +120,57 @@ func (s *FileStore) Delete(ctx context.Context, task TaskID) error {
 	return err
 }
 
-// writeFileRenamed writes data to a temp file in the same directory and
-// atomically renames it into place. Readers therefore always observe
-// either the previous complete file or the new complete file, never a
-// partially written one.
+// sweepTempFiles removes interrupted-write leftovers: temp files at the
+// root and inside shard directories. Committed *.cache entries and shard
+// directories (which may be in use by another handle) are never removed.
+// The caller must hold the exclusive store lock.
+func (s *FileStore) sweepTempFiles() error {
+	rootEntries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	for _, de := range rootEntries {
+		name := de.Name()
+		if !de.IsDir() {
+			if hasPrefix(name, tmpPrefix) {
+				_ = os.Remove(filepath.Join(s.dir, name))
+			}
+			continue
+		}
+		if !isShardDir(name) {
+			continue
+		}
+		shard := filepath.Join(s.dir, name)
+		entries, err := os.ReadDir(shard)
+		if err != nil {
+			// The directory may have vanished under us; that is fine.
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		for _, se := range entries {
+			if !se.IsDir() && hasPrefix(se.Name(), tmpPrefix) {
+				_ = os.Remove(filepath.Join(shard, se.Name()))
+			}
+		}
+	}
+	return nil
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// writeFileRenamed writes data to a uniquely named temp file in the same
+// directory and atomically renames it into place. Readers therefore
+// always observe either the previous complete file or the new complete
+// file, never a partially written one. If the process is interrupted
+// before the rename, the leftover temp file is reclaimed on the next
+// NewFileStore.
 func writeFileRenamed(path string, data []byte) error {
 	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".tmp-*")
+	f, err := os.CreateTemp(dir, tmpPrefix+"*")
 	if err != nil {
 		return err
 	}
