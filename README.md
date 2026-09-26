@@ -32,54 +32,95 @@ results, err := e.Run(ctx, "a")
 4. 解析成功后得到拓扑序。执行器在任务的全部依赖完成后立即调度该任务，因此
    **无依赖关系的任务会并发执行**（并发度有上限，避免 goroutine 无界增长）。
 
-## 指纹与缓存命中规则
+## 命中与失效判定（基于实际消费内容）
 
-每个任务的稳定指纹由以下内容做域分离、长度前缀的 SHA-256 计算得到：
+命中只取决于**任务实际消费到的内容**，而不是上游是否被重新执行。每个任务的
+**内容指纹**由以下成分做域分离、长度前缀的 SHA-256 得到：
 
 - 任务 ID；
 - 任务自身的 `Inputs`（输入与配置）；
-- 直接依赖指纹的有序集合（依赖按声明顺序参与，并包含依赖数量）。
+- 任务上一次成功执行时**实际读取过的直接依赖产物**：按首次读取顺序记录，
+  每项包含依赖 ID 与该次读取拿到的产物**字节的哈希**。
 
-由于依赖指纹递归地嵌入了各自上游的输入，**任务指纹相等当且仅当该任务及其整条
-上游链路上的输入/配置均未变化**。
+因此：
 
-命中判定（见 `runTask`）：
+- 上游的输入/配置变了、上游也确实重算了，但只要它这次产出的字节与上次**逐字节
+  一致**，下游重放出来的内容指纹就不变 → **下游继续命中、绝不重算**；
+- 上游产物字节一旦变化，所有**读取过**该产物的下游指纹必然变化 → **全部失效重算，
+  绝不复用旧产物**；
+- 声明了却没有读取的依赖，其变化不会牵连本任务。
 
-- 从 `Store` 读取该任务条目；
-- 条目的逻辑版本 `Entry.Version` 必须等于当前 `graph.Version`；
-- 条目的指纹必须等于当前解析出的指纹。
+未读取任何依赖的任务，其指纹仅由 ID 与自身 Inputs 决定。
 
-两者都满足时直接复用缓存产物，标记 `Cached: true`，不调用 `Run`。
+### 指纹的产生与重放
 
-### 失效传播
+- 解析（`resolve`）只做校验、环检测与拓扑排序，**不再**预先计算指纹——因为指纹
+  依赖运行时才能拿到的上游产物字节。
+- 任务执行时，`Inputs.Artifact` 会记录每个被读取的**已声明**依赖（ID + 字节哈希，
+  重复读取只记一次）。执行成功后用这些记录与当前 Inputs 算出内容指纹，连同
+  “消费清单”（`Entry.Consumed`）一起原子写入缓存。
+- 下次运行命中判定：读出条目，按其记录的消费清单从**当前**依赖产物字节重算哈希与
+  内容指纹；条目版本受支持且指纹一致才复用，标记 `Cached: true`，否则执行任务。
 
-- 任一任务的 `Inputs` 变化 → 其指纹变化 → 该任务缓存未命中并重算；
-- 其指纹进入下游指纹 → 受影响的下游任务级联失效，仅这些任务重算；
-- 不在受影响下游链路上的任务指纹不变，**继续命中，绝不被丢弃或重算**；
-- 重新注册任务（`Register`）不会主动删除缓存；旧条目因指纹不再匹配而被自然
-  忽略，并在任务下次成功后被覆盖。
+该判定完全基于持久化内容，因此**进程重启后同样成立**：上游因配置变化而重算、但
+产物字节不变时，下游在新进程里依旧命中磁盘条目。
 
-> 注意：指纹只覆盖显式声明的输入、配置与上游产物。若任务读取了未写入
-> `Inputs` 的外部状态（如墙上时钟、随机源），引擎无法感知这种变化——调用方
-> 应把所有影响输出的输入纳入 `Inputs`。
+> 注意：指纹只覆盖显式声明的 `Inputs` 与任务**实际读取**的上游产物字节。若任务的
+> 产物受未写入 `Inputs` 的外部状态影响（墙上时钟、随机源、隐式文件等），引擎无法
+> 感知这类变化——调用方应把所有影响输出的输入纳入 `Inputs`。
 
 ### 进程重启后的持久命中
 
 `FileStore` 把每个任务的缓存条目以单文件形式存放在目录中（`NewFileStore(dir)`），
-写入采用“临时文件 + fsync + 原子 rename”，读者只会看到旧的完整文件或新的完整
-文件，不会读到部分写入。使用同一目录重建 `Engine` 即可在重启后继续命中。
+写入采用“加目录锁 → 清理中断残留 → 临时文件 + fsync + 原子 rename”，读者只会看到
+旧的完整文件或新的完整文件，不会读到部分写入。使用同一目录重建 `Engine` 即可在
+重启后继续命中。
 
-### 版本兼容与损坏处理
+### 任务标识到文件名：任意合法 ID、平面、无碰撞、目录隔离
 
-磁盘格式：`magic "IBGC" | 格式版本(1B) | 长度前缀字段 | SHA-256 校验和`。
+任务 ID 不会被直接拼进路径，而是映射为**仅含十六进制字符**的平面文件名
+（`entryKey`）：
 
-- 磁盘格式版本不被识别 → 返回 `ErrCacheVersion`；
-- 魔数错误、截断、长度越界、尾部多余字节或校验和不匹配 → 返回
-  `ErrCacheCorrupt`；
-- 条目的**逻辑版本**（`Entry.Version`）过旧/过新 → 视为未命中。
+- 普通长度的 ID：对原始字节做十六进制编码（在 ID 集合上是双射，**绝不碰撞**），
+  再加固定后缀；
+- 超长 ID：使用域分离前缀 `"task:" + id` 的 SHA-256，文件名形如
+  `h-<64hex>.cache`。
 
-以上情况引擎一律当作干净的缓存未命中处理：任务重新执行，成功后原子覆盖坏文件
-（自愈），不影响正确性。
+因此 ID 中包含路径分隔符（`/`、`\`）、`.`/`..` 层级片段、前导分隔符、空格、
+Unicode 甚至空串都完全合法：可正常写入、命中、跨重启复用与删除，且文件始终直接
+落在缓存目录内，**不会创建子目录，也不可能逃逸或覆盖目录外的文件**。不同缓存
+目录之间严格隔离：一个目录中的条目不会被另一个目录读到或覆盖。
+
+### 版本兼容、内容损坏与中断残留
+
+磁盘格式（v2）：
+
+```
+magic "IBGC" | 格式版本(1B)
+| len前缀字段 × 5：逻辑版本(u32)、任务ID、内容指纹、产物字节、消费清单
+| SHA-256(前面全部字节)
+```
+
+其中“消费清单”为 `count(uvarint) | (任务ID len前缀 | 产物哈希 len前缀)*count`，
+记录任务实际读取的上游产物字节哈希。
+
+两类失败被**明确区分**（调用方可 `errors.Is` 判断），引擎都按干净的未命中处理，
+任务重算成功后原子覆盖坏文件（自愈）：
+
+- `ErrCacheVersion`：无法识别的磁盘格式版本字节，或结构完好但**逻辑版本**
+  过旧/过新（`Entry.Version != graph.Version`）；
+- `ErrCacheCorrupt`：魔数错误、截断、长度越界、尾部多余字节、校验和不匹配、
+  指纹/哈希非十六进制或长度不符，以及条目内容与其所在键不一致等。
+
+中断写入会留下 `.tmp-*` 临时文件：
+
+- 临时文件永远不会被当作条目读取（命名不同），所以不影响正常命中；
+- 复用目录（`NewFileStore`）以及每次 `Put` 前，会在持有**目录锁**时清扫
+  `.tmp-*` **普通文件**，因此残留不会无限堆积；
+- 清扫只匹配此前缀、只删普通文件、不递归，**绝不会误删任何有效条目**或锁文件；
+  命名相似的目录/符号链接会被保留；
+- 目录锁（Unix 上为对 `.lock` 文件的 `flock`，进程崩溃后由内核自动释放）保证
+  同一目录被多个进程/实例并发使用时，清理与写入彼此串行、仍然安全。
 
 ## 并发语义
 
@@ -104,24 +145,26 @@ results, err := e.Run(ctx, "a")
 
 ```
 graph/
-  types.go         公共类型（Task / Artifact / Result / CycleError）
-  errors.go        哨兵错误与 TaskError
-  engine.go        引擎、注册、运行入口、Validate
-  schedule.go      解析（校验/环检测/拓扑/指纹）与并发执行器
-  fingerprint.go   稳定指纹
-  cache.go         Store 接口与内存实现
-  file_store.go    跨进程持久化 Store（原子写入）
-  encoding.go      磁盘条目编码/解码（版本 + 校验和）
-  *_test.go        全场景自动化测试
+  types.go             公共类型（Task / Artifact / Result / CycleError）、逻辑版本
+  errors.go            哨兵错误（含 ErrCacheVersion / ErrCacheCorrupt）与 TaskError
+  engine.go            引擎、注册、运行入口、Validate
+  schedule.go          解析（校验/环检测/拓扑）与并发执行器、内容指纹命中与消费记录
+  fingerprint.go       基于自身输入与实际消费产物字节的内容指纹
+  cache.go             Store 接口、Entry/ConsumedDep 与内存实现
+  file_store.go        跨进程持久化 Store（平面键名、目录锁、残留清扫、原子写入）
+  encoding.go          磁盘条目编解码（格式版本 + 消费清单 + 校验和）
+  dirlock_unix.go      Unix 目录锁（flock）
+  dirlock_windows.go   Windows 下的锁占位
+  *_test.go            全场景自动化测试
 ```
 
 ## 验证方法
 
 ```bash
-go test ./...                 # 全部测试
-go test -race ./...           # 竞态检测（需 CGO_ENABLED=1）
-go test -cover ./...          # 覆盖率
-go test -run TestCycle ./...  # 只跑循环依赖用例
+go test ./...                              # 全部测试
+CGO_ENABLED=1 go test -race ./...          # 竞态检测（需 CGO）
+go test -cover ./...                       # 覆盖率
+go test -run TestUpstream ./...            # 只跑“上游重算/字节变化”相关用例
 go vet ./...
 ```
 
@@ -131,8 +174,14 @@ go vet ./...
 | --- | --- |
 | 增量命中 | `TestIncrementalHit` |
 | 失效传播 / 无关结果保留 | `TestInvalidationPropagation`、`TestUnrelatedResultsUntouched` |
+| 上游重算但字节不变→下游命中且只有上游执行 | `TestUpstreamRecomputeSameBytesDownstreamHit` |
+| 上游字节变→下游失效、不用旧产物（含跨重启） | `TestUpstreamBytesChangeInvalidatesDownstream`、`TestUpstreamBytesChangeAcrossRestart`、`TestUpstreamSameBytesDownstreamHitAcrossRestart` |
+| 只有实际读取的依赖影响命中 | `TestOnlyConsumedUpstreamsMatter` |
+| 任意 ID（分隔符/层级/空/超长）写入、跨重启、删除 | `TestArbitraryTaskIDsRoundTrip`、`TestArbitraryTaskIDsAcrossRestart`、`TestWeirdIDsThroughEngine`、`TestEntryKeysAreCollisionFree` |
+| 缓存目录严格隔离 | `TestCacheDirectoriesAreIsolated` |
+| 版本不兼容 vs 内容损坏被区分、皆为未命中且自愈 | `TestVersionAndCorruptionDistinguished`、`TestOldVersionEntry`、`TestOldOnDiskFormat`、`TestCorruptEntriesAreMisses` |
+| 中断残留清理且有效条目不受影响 / 并发同目录安全 | `TestOrphanTempFilesCleanedOnReuse`、`TestLockSerializesCleanup`、`TestConcurrentFileStoresSameDirectory` |
 | 循环依赖（含自环、状态不被破坏） | `TestCycleDetection`、`TestSelfCycle`、`TestCycleDoesNotCorruptState` |
 | 无依赖任务并发 / 并发触发一致 / 依赖顺序 | `TestIndependentTasksRunConcurrently`、`TestConcurrentTriggersConsistent`、`TestDependencyOrdering` |
-| 缓存重启命中 | `TestFileStoreRestartHit` |
-| 损坏 / 截断 / 篡改 / 旧版本 | `TestCorruptEntriesAreMisses`、`TestOldVersionEntry`、`TestOldOnDiskFormat` |
+| 缓存重启命中 | `TestFileStoreRestartHit`、`TestRestartInvalidation` |
 | 失败隔离 / 重试恢复 / 过期产物隔离 | `TestFailureDownstreamNotExecuted`、`TestRetryRecovery`、`TestFailureDoesNotInvalidateUnrelatedCache`、`TestFailureDownstreamStaleArtifacts` |

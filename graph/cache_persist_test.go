@@ -2,8 +2,9 @@ package graph
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 )
@@ -64,26 +65,26 @@ func TestCorruptEntriesAreMisses(t *testing.T) {
 	cases := map[string][]byte{
 		"garbage": []byte("not a cache file at all!!"),
 		"truncated": func() []byte {
-			b, _ := os.ReadFile(filepath.Join(dir, "a.cache"))
+			b, _ := os.ReadFile(mustFileStore(t, dir).path("a"))
 			return b[:len(b)/2]
 		}(),
 		"tampered": func() []byte {
-			b, _ := os.ReadFile(filepath.Join(dir, "a.cache"))
+			b, _ := os.ReadFile(mustFileStore(t, dir).path("a"))
 			b = append([]byte(nil), b...)
 			b[len(b)-2] ^= 0xFF
 			return b
 		}(),
 	}
 	for name, corrupt := range cases {
-		if err := os.WriteFile(filepath.Join(dir, "a.cache"), corrupt, 0o644); err != nil {
+		if err := os.WriteFile(mustFileStore(t, dir).path("a"), corrupt, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		store, err := NewFileStore(dir)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.Get(ctx, "a"); err == nil {
-			t.Fatalf("case %s: expected error on corrupt entry", name)
+		if _, err := store.Get(ctx, "a"); !errors.Is(err, ErrCacheCorrupt) {
+			t.Fatalf("case %s: expected ErrCacheCorrupt, got %v", name, err)
 		}
 		// Engine treats it as a miss, recomputes, and self-heals.
 		e2, aRuns2, bRuns2 := buildTwoNodeGraph(store)
@@ -125,18 +126,18 @@ func TestOldVersionEntry(t *testing.T) {
 	old := Entry{
 		Version:     Version - 1,
 		Task:        "a",
-		Fingerprint: "doesnt-matter",
+		Fingerprint: validFP,
 		Output:      Artifact{Data: []byte("ancient")},
 	}
 	if err := store.Put(ctx, old); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.Get(ctx, "a")
-	if err != nil {
-		t.Fatalf("decoding old-format file should succeed: %v", err)
+	if !errors.Is(err, ErrCacheVersion) {
+		t.Fatalf("unsupported logical version should report ErrCacheVersion, got entry=%+v err=%v", got, err)
 	}
-	if got.Version != Version-1 {
-		t.Fatalf("version round-trip wrong: %d", got.Version)
+	if errors.Is(err, ErrCacheCorrupt) {
+		t.Fatalf("an incompatible version must not be classified as corrupt: %v", err)
 	}
 	e2, aRuns, _ := buildTwoNodeGraph(mustFileStore(t, dir))
 	res, err := e2.Run(ctx, "b")
@@ -152,7 +153,9 @@ func TestOldVersionEntry(t *testing.T) {
 }
 
 // TestOldOnDiskFormat verifies a previous on-disk format version byte
-// is rejected as incompatible and treated as a miss.
+// (with an otherwise intact, checksum-valid file) is rejected as
+// incompatible and treated as a miss, rather than classified as
+// corrupt.
 func TestOldOnDiskFormat(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -160,19 +163,26 @@ func TestOldOnDiskFormat(t *testing.T) {
 	if _, err := e.Run(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
-	p := filepath.Join(dir, "a.cache")
+	p := mustFileStore(t, dir).path("a")
 	b, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Flip format version byte (magic = 4 bytes, then version).
+	// Flip the format version byte (magic = 4 bytes, then version) and
+	// recompute the trailing checksum so the file is structurally valid
+	// but carries an unrecognized format version.
 	b[4] = 99
+	sum := sha256.Sum256(b[:len(b)-sha256.Size])
+	copy(b[len(b)-sha256.Size:], sum[:])
 	if err := os.WriteFile(p, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	store := mustFileStore(t, dir)
-	if _, err := store.Get(ctx, "a"); err == nil {
-		t.Fatal("expected ErrCacheVersion for unknown format byte")
+	if _, err := store.Get(ctx, "a"); !errors.Is(err, ErrCacheVersion) {
+		t.Fatalf("expected ErrCacheVersion for unknown format byte, got %v", err)
+	}
+	if errors.Is(err, ErrCacheCorrupt) {
+		t.Fatalf("an intact file with an unknown version is not corrupt: %v", err)
 	}
 	// Still recoverable.
 	e2, aRuns, _ := buildTwoNodeGraph(store)
@@ -186,6 +196,10 @@ func TestOldOnDiskFormat(t *testing.T) {
 	if v := atomic.LoadInt32(aRuns); v != 1 {
 		t.Fatalf("a should run once, got %d", v)
 	}
+	// Self-healed: the replaced file is current and usable.
+	if _, err := store.Get(ctx, "a"); err != nil {
+		t.Fatalf("entry did not self-heal: %v", err)
+	}
 }
 
 // TestEncodeDecodeRoundTrip exercises the codec directly.
@@ -193,8 +207,12 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	e := Entry{
 		Version:     Version,
 		Task:        "task-x",
-		Fingerprint: "fp123",
-		Output:      Artifact{Data: []byte{0, 1, 2, 3, 255}},
+		Fingerprint: validFP,
+		Consumed: []ConsumedDep{
+			{Task: "dep-1", DataHash: validFP},
+			{Task: "dep-2", DataHash: artifactHash([]byte("xyz"))},
+		},
+		Output: Artifact{Data: []byte{0, 1, 2, 3, 255}},
 	}
 	got, err := decodeEntry(encodeEntry(e))
 	if err != nil {
@@ -204,7 +222,19 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 		got.Version != e.Version || string(got.Output.Data) != string(e.Output.Data) {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
+	if len(got.Consumed) != len(e.Consumed) {
+		t.Fatalf("consumed round trip mismatch: %+v", got.Consumed)
+	}
+	for i := range e.Consumed {
+		if got.Consumed[i] != e.Consumed[i] {
+			t.Fatalf("consumed[%d] mismatch: %+v != %+v",
+				i, got.Consumed[i], e.Consumed[i])
+		}
+	}
 }
+
+// validFP is a structurally valid 64-hex fingerprint for tests.
+const validFP = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 func mustFileStore(t *testing.T, dir string) *FileStore {
 	t.Helper()

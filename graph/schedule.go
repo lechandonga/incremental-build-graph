@@ -7,12 +7,12 @@ import (
 )
 
 // resolution is the computed execution plan for one Run: the set of
-// reachable tasks in a topological order, together with per-task
-// fingerprints derived from the current inputs.
+// reachable tasks in a topological order. Content fingerprints are not
+// computed here because they depend on the actual upstream artifact
+// bytes, which are only known once dependencies have executed.
 type resolution struct {
-	order       []TaskID
-	fingerprint map[TaskID]string
-	tasks       map[TaskID]*Task
+	order []TaskID
+	tasks map[TaskID]*Task
 }
 
 // resolve performs validation, cycle detection, reachability from
@@ -43,7 +43,6 @@ func (e *Engine) resolve(targets []TaskID) (*resolution, error) {
 		black = 2
 	)
 	color := make(map[TaskID]int)
-	fp := make(map[TaskID]string)
 	var order []TaskID
 
 	type frame struct {
@@ -99,26 +98,13 @@ func (e *Engine) resolve(targets []TaskID) (*resolution, error) {
 				}
 				continue
 			}
-			// All dependencies resolved: compute fingerprint from
-			// already-finalized dependency fingerprints. Duplicate
-			// edges on the same dependency are de-duplicated, matching
-			// the executor's indegree handling.
-			seenDep := make(map[TaskID]bool, len(t.Deps))
-			var depFps []string
-			for _, dep := range t.Deps {
-				if !seenDep[dep] {
-					seenDep[dep] = true
-					depFps = append(depFps, fp[dep])
-				}
-			}
-			fp[f.id] = fingerprint(t, depFps)
 			color[f.id] = black
 			order = append(order, f.id)
 			stack = stack[:len(stack)-1]
 		}
 	}
 
-	return &resolution{order: order, fingerprint: fp, tasks: tasks}, nil
+	return &resolution{order: order, tasks: tasks}, nil
 }
 
 // taskInputs adapts completed results to the Inputs interface.
@@ -328,39 +314,69 @@ func (e *Engine) execute(ctx context.Context, r *resolution) (map[TaskID]Result,
 // depResult fetches a completed dependency result.
 type depResult func(id TaskID) (Result, bool)
 
-// runTask produces one task Result: cache hit when the stored
-// fingerprint matches, otherwise execute and commit the new entry.
+// runTask produces one task Result.
+//
+// Cache hit is decided purely from the task's content: its own
+// inputs/config and the bytes of the upstream artifacts it actually
+// consumed on its last successful execution. Whether an upstream was
+// itself recomputed is irrelevant; only the upstream artifact bytes
+// matter. On a miss the task runs, the upstream artifacts it reads are
+// recorded (with hashes of their exact bytes), and the new entry is
+// committed atomically.
 func (e *Engine) runTask(ctx context.Context, r *resolution, id TaskID, deps depResult) (Result, error) {
 	t := r.tasks[id]
-	wantFP := r.fingerprint[id]
 
-	if entry, err := e.store.Get(ctx, id); err == nil {
-		if entry.Version == Version && entry.Fingerprint == wantFP {
+	if entry, err := e.store.Get(ctx, id); err == nil && entry.Version == Version {
+		// Replay the content fingerprint from the currently available
+		// upstream artifact bytes, using exactly the set the task
+		// consumed when the stored entry was produced.
+		consumed := make([]ConsumedDep, 0, len(entry.Consumed))
+		match := true
+		for _, c := range entry.Consumed {
+			res, ok := deps(c.Task)
+			if !ok {
+				match = false
+				break
+			}
+			consumed = append(consumed, ConsumedDep{
+				Task:     c.Task,
+				DataHash: artifactHash(res.Output.Data),
+			})
+		}
+		if match && contentFingerprint(t, consumed) == entry.Fingerprint {
 			return Result{
 				Task:        id,
 				Output:      entry.Output,
-				Fingerprint: wantFP,
+				Fingerprint: entry.Fingerprint,
 				Cached:      true,
 			}, nil
 		}
 	}
-	// Any error (miss, corrupt, old version) falls through to a fresh
-	// execution; corrupt entries are overwritten on success.
+	// Miss, incompatible version or corrupt entry all fall through to a
+	// fresh execution; the stale file is overwritten on success.
 
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
 
-	in := &liveInputs{r: r, deps: deps}
-	out, err := t.Run(ctx, in)
+	rec := &recordingInputs{
+		deps:     deps,
+		declared: make(map[TaskID]bool, len(t.Deps)),
+	}
+	for _, d := range t.Deps {
+		rec.declared[d] = true
+	}
+	out, err := t.Run(ctx, rec)
 	if err != nil {
 		return Result{}, &TaskError{Task: id, Err: err}
 	}
 
+	fp := contentFingerprint(t, rec.consumed)
 	entry := Entry{
 		Version:     Version,
 		Task:        id,
-		Fingerprint: wantFP,
+		Fingerprint: fp,
+		Consumed:    rec.consumed,
 		Output:      out,
 	}
 	if err := e.store.Put(ctx, entry); err != nil {
@@ -369,22 +385,45 @@ func (e *Engine) runTask(ctx context.Context, r *resolution, id TaskID, deps dep
 	return Result{
 		Task:        id,
 		Output:      out,
-		Fingerprint: wantFP,
+		Fingerprint: fp,
 		Cached:      false,
 	}, nil
 }
 
-// liveInputs resolves upstream artifacts from completed results at
-// execution time.
-type liveInputs struct {
-	r    *resolution
-	deps depResult
+// recordingInputs resolves upstream artifacts from completed results at
+// execution time and records, in first-read order, each DECLARED
+// upstream the task actually reads, together with a hash of the exact
+// artifact bytes handed back. Repeated reads of the same upstream are
+// recorded once. Reads of IDs that are not declared dependencies are
+// resolved the same way but never recorded (they cannot form part of
+// the fingerprint).
+type recordingInputs struct {
+	deps     depResult
+	declared map[TaskID]bool
+
+	mu       sync.Mutex
+	seen     map[TaskID]bool
+	consumed []ConsumedDep
 }
 
-func (in *liveInputs) Artifact(id TaskID) (Artifact, bool) {
+func (in *recordingInputs) Artifact(id TaskID) (Artifact, bool) {
 	res, ok := in.deps(id)
 	if !ok {
 		return Artifact{}, false
+	}
+	if in.declared[id] {
+		in.mu.Lock()
+		if in.seen == nil {
+			in.seen = make(map[TaskID]bool)
+		}
+		if !in.seen[id] {
+			in.seen[id] = true
+			in.consumed = append(in.consumed, ConsumedDep{
+				Task:     id,
+				DataHash: artifactHash(res.Output.Data),
+			})
+		}
+		in.mu.Unlock()
 	}
 	return res.Output, true
 }

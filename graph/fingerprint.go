@@ -5,15 +5,26 @@ import (
 	"encoding/hex"
 )
 
-// fingerprint computes a stable fingerprint for a task from its own
-// inputs/config and the ordered fingerprints of its direct
-// dependencies. Because dependency fingerprints recursively embed their
-// own upstream inputs, a matching fingerprint guarantees the whole
-// transitive input set is unchanged.
+// contentFingerprint computes the stable content fingerprint of a task
+// from:
+//
+//   - the task ID;
+//   - the task's own Inputs (its declared inputs and configuration);
+//   - the ordered set of upstream artifacts it ACTUALLY consumed, where
+//     each contributor is the upstream ID plus a hash of the exact
+//     artifact bytes the task read.
+//
+// Because contributors are keyed by artifact BYTES rather than by
+// upstream fingerprints, re-running an upstream whose inputs/config
+// changed but whose produced bytes are byte-for-byte identical does not
+// change this fingerprint: the downstream keeps hitting the cache. On
+// the other hand, any change in the bytes of a consumed upstream always
+// changes the fingerprint and forces every consuming downstream to be
+// recomputed; a stale downstream artifact can never be reused.
 //
 // Domain-separated length-prefixed framing is used so that structurally
 // different inputs can never collide.
-func fingerprint(t *Task, depFingerprints []string) string {
+func contentFingerprint(t *Task, consumed []ConsumedDep) string {
 	h := sha256.New()
 	writeField := func(prefix byte, b []byte) {
 		h.Write([]byte{prefix})
@@ -31,16 +42,22 @@ func fingerprint(t *Task, depFingerprints []string) string {
 	}
 	writeField('t', []byte(t.ID))
 	writeField('i', t.Inputs)
-	// Dependencies contribute in declared order; the count is included
-	// so different dependency shapes cannot collide either.
-	var depBuf []byte
-	depBuf = appendUvarint(depBuf, uint64(len(depFingerprints)))
-	for _, df := range depFingerprints {
-		depBuf = append(depBuf, df...)
-		depBuf = append(depBuf, 0)
+	// Consumed artifacts contribute in first-read order; the count is
+	// included and each entry carries the upstream ID so that swapping
+	// two upstreams cannot collide.
+	var cBuf []byte
+	cBuf = appendUvarint(cBuf, uint64(len(consumed)))
+	for _, c := range consumed {
+		cBuf = appendBytes(cBuf, []byte(c.Task))
+		cBuf = appendBytes(cBuf, []byte(c.DataHash))
 	}
-	writeField('d', depBuf)
+	writeField('c', cBuf)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// artifactHash returns the stable hash of an artifact's consumed bytes.
+func artifactHash(b []byte) string {
+	return hashString("artifact:", b)
 }
 
 func appendUvarint(dst []byte, v uint64) []byte {

@@ -8,7 +8,11 @@ import (
 )
 
 // Version is the cache entry format version produced by this build.
-const Version = 1
+//
+// The logical version is bumped whenever the meaning or layout of a
+// cache entry changes incompatibly. Entries carrying any other version
+// are reported as ErrCacheVersion and treated as a clean miss.
+const Version = 2
 
 // TaskID identifies a task within a graph.
 type TaskID string
