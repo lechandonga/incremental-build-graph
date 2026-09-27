@@ -20,17 +20,30 @@ const (
 	tmpPrefix = ".tmp-"
 	// entrySuffix terminates every encoded entry file name.
 	entrySuffix = ".cache"
-	// directKeyLimit keeps ordinary entry names short; longer task IDs
-	// are content-hashed instead.
-	directKeyLimit = 200
+	// maxEntryNameLen is the maximum on-disk entry file name length the
+	// store must ever produce. 255 bytes is the single-path-component
+	// limit (NAME_MAX) supported by virtually every local filesystem
+	// (ext4, xfs, tmpfs, APFS, NTFS, ...); keeping every generated name
+	// within it makes any task ID length legal on such filesystems.
+	maxEntryNameLen = 255
+	// directKeyLimit is the longest task ID still stored under its
+	// byte-for-byte hex encoding. A direct name is 2*len(id) plus the
+	// fixed suffix, so this is the largest id for which that name fits in
+	// maxEntryNameLen. Longer IDs are content-hashed instead (whose name
+	// is a short constant length), meaning IDs of *any* length work:
+	// neither medium-length nor very long IDs can overflow the
+	// filesystem's file name limit.
+	directKeyLimit = (maxEntryNameLen - len(entrySuffix)) / 2
 )
 
 // FileStore persists cache entries as one file per task under a
 // directory, so hits survive process restarts.
 //
-// Task IDs are encoded into flat, collision-free file names (only hex
-// digits), so IDs containing path separators, "."/".." segments or any
-// other byte are all legal and never escape the directory or collide.
+// Task IDs are encoded into flat, collision-free file names (hex
+// digits plus fixed punctuation), so IDs containing path separators,
+// "."/".." segments or any other byte are all legal and never escape
+// the directory or collide. Generated names never exceed 255 bytes, so
+// IDs of any length are legal keys (medium-length IDs included).
 // Distinct directories are strictly isolated.
 //
 // Writes use "locked cleanup + temp file + fsync + atomic rename".
@@ -97,10 +110,17 @@ func (s *FileStore) Close() error {
 
 // entryKey maps a task ID to its flat, collision-free file name.
 //
-// Ordinary IDs are hex-encoded byte-for-byte (a bijection over task
-// IDs, so no two IDs ever collide). Over-long IDs fall back to a
-// domain-separated SHA-256 of the ID. The output contains only hex
-// digits plus fixed punctuation, hence never a path separator, so the
+// IDs up to directKeyLimit bytes are hex-encoded byte-for-byte (a
+// bijection over task IDs, so no two IDs ever collide). Longer IDs fall
+// back to a domain-separated SHA-256 of the ID, whose name is a short
+// constant length. The threshold is derived so that even the longest
+// direct name never exceeds maxEntryNameLen bytes (255, the common
+// filesystem component limit); hashed names are far shorter still.
+// Hence task IDs of ANY length are legal keys and never fail with
+// ENAMETOOLONG.
+//
+// The output contains only hex digits plus fixed punctuation ("h-"
+// prefix and ".cache" suffix), hence never a path separator, so the
 // file always lands directly inside the cache directory.
 func entryKey(task TaskID) string {
 	raw := []byte(task)

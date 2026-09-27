@@ -78,18 +78,32 @@ results, err := e.Run(ctx, "a")
 
 ### 任务标识到文件名：任意合法 ID、平面、无碰撞、目录隔离
 
-任务 ID 不会被直接拼进路径，而是映射为**仅含十六进制字符**的平面文件名
-（`entryKey`）：
+任务 ID 不会被直接拼进路径，而是映射为**仅含十六进制字符与固定标点**的平面
+文件名（`entryKey`），并保证生成的文件名**长度永不超过 255 字节**（ext4、
+xfs、tmpfs、APFS、NTFS 等常见本地文件系统的单段名上限 `NAME_MAX`）：
 
-- 普通长度的 ID：对原始字节做十六进制编码（在 ID 集合上是双射，**绝不碰撞**），
-  再加固定后缀；
-- 超长 ID：使用域分离前缀 `"task:" + id` 的 SHA-256，文件名形如
-  `h-<64hex>.cache`。
+- 长度 **≤ 124 字节**的 ID：对原始字节做十六进制编码（在 ID 集合上是双射，
+  **绝不碰撞**），再加固定后缀 `.cache`。阈值由 `2×len(id)+len(".cache") ≤ 255`
+  推导（`directKeyLimit`），所以即使最长的直接编码名也只有 254 字节；
+- 长度 **≥ 125 字节**的 ID（即中等长度与超长 ID）：改用域分离前缀
+  `"task:" + id` 的 SHA-256，文件名恒为 72 字节，形如 `h-<64hex>.cache`
+  （`h-` 前缀是十六进制直接编码名不可能出现的字符，两个命名空间天然分离；
+  SHA-256 的碰撞概率可忽略）。
 
-因此 ID 中包含路径分隔符（`/`、`\`）、`.`/`..` 层级片段、前导分隔符、空格、
-Unicode 甚至空串都完全合法：可正常写入、命中、跨重启复用与删除，且文件始终直接
-落在缓存目录内，**不会创建子目录，也不可能逃逸或覆盖目录外的文件**。不同缓存
-目录之间严格隔离：一个目录中的条目不会被另一个目录读到或覆盖。
+> 历史问题：旧版本阈值取 200，于是 **125～200 字节**的 ID 仍走直接编码，
+> 生成 256～406 字节的文件名，在开启文件缓存时直接 `ENAMETOOLONG`、整次
+> 运行中断；更短或超过 200 字节的 ID 反而正常。阈值改为按 255 字节上限推导
+> 后，**任意长度**的合法标识都能正常写入、命中、跨重启复用与删除。
+
+因此 ID 的**字节长度没有任何限制**，其中包含路径分隔符（`/`、`\`）、
+`.`/`..` 层级片段、前导分隔符、空格、Unicode、NUL 之外的任意字节甚至空串都
+完全合法：可正常写入、命中、跨重启复用与删除，且文件始终直接落在缓存目录内，
+**不会创建子目录，也不可能逃逸或覆盖目录外的文件**。
+
+**目录隔离**：文件名只与 ID 字节有关、不含任何目录前缀；不同缓存目录之间严格
+隔离——一个目录中的条目不会被另一个目录读到或覆盖，在两个目录中写入同一 ID
+也互不影响。（要求缓存目录所在文件系统支持至少 255 字节的单段文件名，即符合
+POSIX `NAME_MAX=255` 的常见本地文件系统。）
 
 ### 版本兼容、内容损坏与中断残留
 
@@ -116,11 +130,16 @@ magic "IBGC" | 格式版本(1B)
 
 - 临时文件永远不会被当作条目读取（命名不同），所以不影响正常命中；
 - 复用目录（`NewFileStore`）以及每次 `Put` 前，会在持有**目录锁**时清扫
-  `.tmp-*` **普通文件**，因此残留不会无限堆积；
+  `.tmp-*` **普通文件**，因此残留不会无限堆积；写入自身若在 rename 前任一步
+  失败（写盘、fsync、关闭出错，包括旧版本里目标文件名超长导致的 rename
+  失败），会立即删除自己的临时文件，**不会留下半写文件**，也不会触碰同目录
+  里其它任务已经有效的条目；
 - 清扫只匹配此前缀、只删普通文件、不递归，**绝不会误删任何有效条目**或锁文件；
   命名相似的目录/符号链接会被保留；
 - 目录锁（Unix 上为对 `.lock` 文件的 `flock`，进程崩溃后由内核自动释放）保证
-  同一目录被多个进程/实例并发使用时，清理与写入彼此串行、仍然安全。
+  同一目录被多个进程/实例并发使用时，清理与写入彼此串行、仍然安全；并发写入
+  各自使用独立临时文件、目标名由 ID 唯一确定，因此互不覆盖；rename 的原子性
+  保证任何读者都不会读到不完整内容。
 
 ## 并发语义
 
@@ -165,6 +184,7 @@ go test ./...                              # 全部测试
 CGO_ENABLED=1 go test -race ./...          # 竞态检测（需 CGO）
 go test -cover ./...                       # 覆盖率
 go test -run TestUpstream ./...            # 只跑“上游重算/字节变化”相关用例
+go test -run TestMedium ./...              # 只跑中等/任意长度层级 ID 的修复回归用例
 go vet ./...
 ```
 
@@ -178,6 +198,7 @@ go vet ./...
 | 上游字节变→下游失效、不用旧产物（含跨重启） | `TestUpstreamBytesChangeInvalidatesDownstream`、`TestUpstreamBytesChangeAcrossRestart`、`TestUpstreamSameBytesDownstreamHitAcrossRestart` |
 | 只有实际读取的依赖影响命中 | `TestOnlyConsumedUpstreamsMatter` |
 | 任意 ID（分隔符/层级/空/超长）写入、跨重启、删除 | `TestArbitraryTaskIDsRoundTrip`、`TestArbitraryTaskIDsAcrossRestart`、`TestWeirdIDsThroughEngine`、`TestEntryKeysAreCollisionFree` |
+| 中等长度（125～200B，旧版本必崩区间）及任意长度层级 ID 的写入/命中/跨重启/删除、键长≤255 与无碰撞、不干扰他人条目、引擎级跨重启、同目录并发 | `TestMediumHierarchicalTaskIDsRoundTrip`、`TestMediumIDsIsolatedAcrossDirectories`、`TestMediumIDsDoNotDisturbOtherEntries`、`TestMediumHierarchicalIDThroughEngine`、`TestMediumIDsConcurrentSameDirectory`、`TestMediumEntryKeysAreFlatCollisionFreeAndBounded` |
 | 缓存目录严格隔离 | `TestCacheDirectoriesAreIsolated` |
 | 版本不兼容 vs 内容损坏被区分、皆为未命中且自愈 | `TestVersionAndCorruptionDistinguished`、`TestOldVersionEntry`、`TestOldOnDiskFormat`、`TestCorruptEntriesAreMisses` |
 | 中断残留清理且有效条目不受影响 / 并发同目录安全 | `TestOrphanTempFilesCleanedOnReuse`、`TestLockSerializesCleanup`、`TestConcurrentFileStoresSameDirectory` |
