@@ -81,10 +81,15 @@ results, err := e.Run(ctx, "a")
 任务 ID 不会被直接拼进路径，而是映射为**仅含十六进制字符**的平面文件名
 （`entryKey`）：
 
-- 普通长度的 ID：对原始字节做十六进制编码（在 ID 集合上是双射，**绝不碰撞**），
-  再加固定后缀；
-- 超长 ID：使用域分离前缀 `"task:" + id` 的 SHA-256，文件名形如
+- 普通长度的 ID（原始字节长度 ≤ 124）：对原始字节做十六进制编码（在 ID 集合上
+  是双射，**绝不碰撞**），再加固定后缀；
+- 更长的 ID：使用域分离前缀 `"task:" + id` 的 SHA-256，文件名形如
   `h-<64hex>.cache`。
+
+**长度边界**：任务标识本身没有长度上限，任意长度的合法 ID 都可作为缓存条目键。
+直接编码的阈值 124 取自文件系统的单路径分量上限（ext4 等 NAME_MAX = 255 字节）：
+`2*124 + len(".cache") = 254 ≤ 255`，因此任何 ID 产生的文件名都在 255 字节以内，
+**不存在因标识长度而写入失败的情形**（包括一百多字符的中等长度层级路径式标识）。
 
 因此 ID 中包含路径分隔符（`/`、`\`）、`.`/`..` 层级片段、前导分隔符、空格、
 Unicode 甚至空串都完全合法：可正常写入、命中、跨重启复用与删除，且文件始终直接
@@ -178,6 +183,7 @@ go vet ./...
 | 上游字节变→下游失效、不用旧产物（含跨重启） | `TestUpstreamBytesChangeInvalidatesDownstream`、`TestUpstreamBytesChangeAcrossRestart`、`TestUpstreamSameBytesDownstreamHitAcrossRestart` |
 | 只有实际读取的依赖影响命中 | `TestOnlyConsumedUpstreamsMatter` |
 | 任意 ID（分隔符/层级/空/超长）写入、跨重启、删除 | `TestArbitraryTaskIDsRoundTrip`、`TestArbitraryTaskIDsAcrossRestart`、`TestWeirdIDsThroughEngine`、`TestEntryKeysAreCollisionFree` |
+| 中等长度层级 ID（含旧 NAME_MAX 失败窗口 125–200 字节）写入/命中/跨重启/删除、键长不变式、近邻 ID 互不串扰、并发同目录 | `TestMediumLengthIDsRoundTrip`、`TestMediumLengthIDsAcrossRestart`、`TestEntryKeyFitsNameMax`、`TestMediumLengthIDsNoCrossTalk`、`TestMediumLengthIDsConcurrent` |
 | 缓存目录严格隔离 | `TestCacheDirectoriesAreIsolated` |
 | 版本不兼容 vs 内容损坏被区分、皆为未命中且自愈 | `TestVersionAndCorruptionDistinguished`、`TestOldVersionEntry`、`TestOldOnDiskFormat`、`TestCorruptEntriesAreMisses` |
 | 中断残留清理且有效条目不受影响 / 并发同目录安全 | `TestOrphanTempFilesCleanedOnReuse`、`TestLockSerializesCleanup`、`TestConcurrentFileStoresSameDirectory` |

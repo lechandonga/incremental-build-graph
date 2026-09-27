@@ -22,7 +22,14 @@ const (
 	entrySuffix = ".cache"
 	// directKeyLimit keeps ordinary entry names short; longer task IDs
 	// are content-hashed instead.
-	directKeyLimit = 200
+	//
+	// The limit must respect the 255-byte per-component file name cap
+	// (NAME_MAX on ext4 and most other file systems): a directly encoded
+	// name is 2*limit hex digits plus the suffix, so the largest safe
+	// value is (255-len(entrySuffix))/2 = 124. A larger limit makes
+	// medium-length IDs fail with "file name too long" while shorter and
+	// hashed longer IDs keep working.
+	directKeyLimit = 124
 )
 
 // FileStore persists cache entries as one file per task under a
@@ -101,7 +108,9 @@ func (s *FileStore) Close() error {
 // IDs, so no two IDs ever collide). Over-long IDs fall back to a
 // domain-separated SHA-256 of the ID. The output contains only hex
 // digits plus fixed punctuation, hence never a path separator, so the
-// file always lands directly inside the cache directory.
+// file always lands directly inside the cache directory. Every
+// produced name is well under the 255-byte file name limit, so no
+// legal task ID can fail for length reasons.
 func entryKey(task TaskID) string {
 	raw := []byte(task)
 	if len(raw) <= directKeyLimit {
